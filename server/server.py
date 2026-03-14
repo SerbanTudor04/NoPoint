@@ -23,6 +23,12 @@ from protocol.transport import Transport
 
 log = logging.getLogger("nopoint.server")
 
+DEFAULT_USERS={
+    "tudors":"tudors",
+    "rzv":'rzv',
+    'ts':'ts',
+    'rog':'rog'
+}
 
 # ── In-progress uploads ────────────────────────────────────────────────────────
 class PendingUpload:
@@ -310,5 +316,5 @@ class ClouDriveServer:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
-    srv = ClouDriveServer()
+    srv = NoPointServer()
     asyncio.run(srv.serve_forever())
