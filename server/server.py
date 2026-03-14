@@ -1,10 +1,3 @@
-"""
-NoPoint Server
-=================
-Async TCP server.  Each client gets its own handler coroutine.
-Storage root is just a local directory tree (swap for S3/DB later).
-"""
-
 import asyncio
 import hashlib
 import json
@@ -30,14 +23,23 @@ DEFAULT_USERS={
     'rog':'rog'
 }
 
+# Functie ajutatoare pentru a calcula hash-ul fara sa umplem RAM-ul
+def calculate_file_hash(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(MAX_CHUNK):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 # ── In-progress uploads ────────────────────────────────────────────────────────
 class PendingUpload:
     def __init__(self, path: Path, total_size: int, expected_sha256: str):
-        self.path          = path
-        self.total_size    = total_size
-        self.expected_sha  = expected_sha256
-        self.received      = 0
-        self.fh            = open(path, "wb")
+        self.path = path
+        self.total_size = total_size
+        self.expected_sha = expected_sha256
+        self.received = 0
+        self.fh = open(path, "wb")
 
     def write_chunk(self, data: bytes):
         self.fh.write(data)
@@ -45,7 +47,8 @@ class PendingUpload:
 
     def finalize(self) -> bool:
         self.fh.close()
-        actual = sha256(self.path.read_bytes())
+        # FIX: Folosim functia cu chunk-uri, nu self.path.read_bytes()
+        actual = calculate_file_hash(self.path)
         return actual == self.expected_sha
 
     def abort(self):
@@ -56,27 +59,24 @@ class PendingUpload:
 # ── Client session ─────────────────────────────────────────────────────────────
 class ClientSession:
     def __init__(self, transport: Transport, storage_root: Path, users: Dict[str, str]):
-        self.transport    = transport
-        self.root         = storage_root
-        self.users        = users          # {username: password}
+        self.transport = transport
+        self.root = storage_root
+        self.users = users
         self.authenticated = False
         self.username: Optional[str] = None
         self._uploads: Dict[str, PendingUpload] = {}
 
-    # ── User-scoped storage path ───────────────────────────────────────────────
     def _user_root(self) -> Path:
         p = self.root / self.username
         p.mkdir(parents=True, exist_ok=True)
         return p
 
     def _resolve(self, rel: str) -> Path:
-        """Safely resolve a relative path inside the user's storage root."""
         target = (self._user_root() / rel).resolve()
         if not str(target).startswith(str(self._user_root().resolve())):
             raise ProtocolError("Path traversal detected")
         return target
 
-    # ── Main dispatch loop ─────────────────────────────────────────────────────
     async def run(self):
         peer = self.transport.peer
         log.info("[+] Client connected: %s", peer)
@@ -97,24 +97,24 @@ class ClientSession:
             await self.transport.close()
 
     async def _dispatch(self, frame: Frame):
-        # Require auth for everything except AUTH_REQ / PING
         if not self.authenticated and frame.msg_type not in (MsgType.AUTH_REQ, MsgType.PING):
             await self.transport.send(error(401, "Not authenticated"))
             return
 
         handlers = {
-            MsgType.AUTH_REQ:      self._handle_auth,
-            MsgType.PING:          self._handle_ping,
-            MsgType.UPLOAD_START:  self._handle_upload_start,
-            MsgType.UPLOAD_CHUNK:  self._handle_upload_chunk,
-            MsgType.UPLOAD_DONE:   self._handle_upload_done,
-            MsgType.DOWNLOAD_REQ:  self._handle_download,
-            MsgType.LIST_DIR:      self._handle_list,
-            MsgType.MKDIR:         self._handle_mkdir,
-            MsgType.DELETE:        self._handle_delete,
-            MsgType.MOVE:          self._handle_move,
-            MsgType.STAT:          self._handle_stat,
-            MsgType.DISCONNECT:    self._handle_disconnect,
+            MsgType.AUTH_REQ: self._handle_auth,
+            MsgType.PING: self._handle_ping,
+            MsgType.UPLOAD_START: self._handle_upload_start,
+            MsgType.UPLOAD_CHUNK: self._handle_upload_chunk,
+            MsgType.UPLOAD_DONE: self._handle_upload_done,
+            MsgType.DOWNLOAD_REQ: self._handle_download,
+            MsgType.LIST_DIR: self._handle_list,
+            MsgType.MKDIR: self._handle_mkdir,
+            MsgType.DELETE: self._handle_delete,
+            MsgType.MOVE: self._handle_move,
+            MsgType.STAT: self._handle_stat,
+            MsgType.SYNC_REQUEST: self._handle_sync_request,  # Adaugat!
+            MsgType.DISCONNECT: self._handle_disconnect,
         }
         handler = handlers.get(frame.msg_type)
         if handler is None:
@@ -122,10 +122,9 @@ class ClientSession:
             return
         await handler(frame)
 
-    # ── Auth ───────────────────────────────────────────────────────────────────
     async def _handle_auth(self, frame: Frame):
         user = frame.meta.get("username", "")
-        pw   = frame.meta.get("password", "")
+        pw = frame.meta.get("password", "")
         if self.users.get(user) == pw:
             self.authenticated = True
             self.username = user
@@ -135,21 +134,18 @@ class ClientSession:
             log.warning("[auth] Failed login for %r", user)
             await self.transport.send(Frame(MsgType.AUTH_FAIL, {"message": "Invalid credentials"}))
 
-    # ── Ping ───────────────────────────────────────────────────────────────────
     async def _handle_ping(self, frame: Frame):
         await self.transport.send(Frame(MsgType.PONG, {"ts": frame.meta.get("ts")}))
 
-    # ── Upload ─────────────────────────────────────────────────────────────────
     async def _handle_upload_start(self, frame: Frame):
-        rel        = frame.meta["path"]          # e.g. "docs/report.pdf"
+        rel = frame.meta["path"]
         total_size = frame.meta["size"]
-        checksum   = frame.meta["sha256"]
-        upload_id  = str(uuid.uuid4())
+        checksum = frame.meta["sha256"]
+        upload_id = str(uuid.uuid4())
 
         dest = self._resolve(rel)
         dest.parent.mkdir(parents=True, exist_ok=True)
 
-        # Write to a temp file first
         tmp = dest.with_suffix(dest.suffix + ".part")
         self._uploads[upload_id] = PendingUpload(tmp, total_size, checksum)
 
@@ -158,19 +154,18 @@ class ClientSession:
 
     async def _handle_upload_chunk(self, frame: Frame):
         upload_id = frame.meta["upload_id"]
-        offset    = frame.meta["offset"]
+        offset = frame.meta.get("offset", 0)
         up = self._uploads.get(upload_id)
         if up is None:
             await self.transport.send(error(404, f"Unknown upload_id: {upload_id}"))
             return
 
         up.write_chunk(frame.payload)
-        log.debug("[upload] CHUNK id=%s  offset=%d  +%dB", upload_id, offset, len(frame.payload))
         await self.transport.send(ack(upload_id=upload_id, received=up.received))
 
     async def _handle_upload_done(self, frame: Frame):
         upload_id = frame.meta["upload_id"]
-        rel       = frame.meta["path"]
+        rel = frame.meta["path"]
         up = self._uploads.pop(upload_id, None)
         if up is None:
             await self.transport.send(error(404, f"Unknown upload_id: {upload_id}"))
@@ -178,7 +173,7 @@ class ClientSession:
 
         dest = self._resolve(rel)
         if up.finalize():
-            up.path.replace(dest)          # atomic rename
+            up.path.replace(dest)
             log.info("[upload] DONE %s  verified ✓", rel)
             await self.transport.send(ack(upload_id=upload_id, sha256_verified=True, path=rel))
         else:
@@ -186,38 +181,39 @@ class ClientSession:
             log.warning("[upload] CHECKSUM MISMATCH %s", rel)
             await self.transport.send(error(422, "Checksum mismatch — upload rejected"))
 
-    # ── Download ───────────────────────────────────────────────────────────────
     async def _handle_download(self, frame: Frame):
-        rel  = frame.meta["path"]
+        rel = frame.meta["path"]
         path = self._resolve(rel)
 
-        if not path.exists():
-            await self.transport.send(error(404, f"Not found: {rel}"))
+        if not path.exists() or not path.is_file():
+            await self.transport.send(error(404, f"Not found or not a file: {rel}"))
             return
 
-        data      = path.read_bytes()
-        file_size = len(data)
-        checksum  = sha256(data)
+        file_size = path.stat().st_size
+        # FIX: Folosim functia optimizata
+        checksum = calculate_file_hash(path)
 
         await self.transport.send(Frame(
             MsgType.DOWNLOAD_START,
             {"path": rel, "size": file_size, "sha256": checksum, "chunk_size": MAX_CHUNK}
         ))
 
-        for offset in range(0, file_size, MAX_CHUNK):
-            chunk = data[offset: offset + MAX_CHUNK]
-            await self.transport.send(Frame(
-                MsgType.DOWNLOAD_CHUNK,
-                {"offset": offset, "chunk_size": len(chunk)},
-                chunk,
-            ))
+        # FIX: Citim de pe disc in chunks si trimitem pe retea fara sa umplem RAM-ul
+        with open(path, "rb") as f:
+            offset = 0
+            while chunk := f.read(MAX_CHUNK):
+                await self.transport.send(Frame(
+                    MsgType.DOWNLOAD_CHUNK,
+                    {"offset": offset, "chunk_size": len(chunk)},
+                    chunk,
+                ))
+                offset += len(chunk)
 
         await self.transport.send(Frame(MsgType.DOWNLOAD_DONE, {"path": rel, "sha256": checksum}))
         log.info("[download] DONE %s  %dB", rel, file_size)
 
-    # ── Filesystem ops ─────────────────────────────────────────────────────────
     async def _handle_list(self, frame: Frame):
-        rel  = frame.meta.get("path", ".")
+        rel = frame.meta.get("path", ".")
         path = self._resolve(rel)
         if not path.is_dir():
             await self.transport.send(error(404, f"Not a directory: {rel}"))
@@ -227,22 +223,37 @@ class ClientSession:
         for item in sorted(path.iterdir()):
             st = item.stat()
             entries.append({
-                "name":     item.name,
-                "type":     "dir" if item.is_dir() else "file",
-                "size":     st.st_size,
+                "name": item.name,
+                "type": "dir" if item.is_dir() else "file",
+                "size": st.st_size,
                 "modified": st.st_mtime,
             })
         await self.transport.send(Frame(MsgType.LIST_RESULT, {"path": rel, "entries": entries}))
 
+    async def _handle_sync_request(self, frame: Frame):
+        """ Returneaza o harta completa (path: hash) a tuturor fisierelor userului. """
+        state = {}
+        user_root = self._user_root()
+
+        # Parcurgem tot directorul recursiv
+        for path in user_root.rglob('*'):
+            if path.is_file():
+                # Calculam calea relativa fata de radacina userului (ex: "poze/vacanta.jpg")
+                rel_path = path.relative_to(user_root).as_posix()
+                state[rel_path] = calculate_file_hash(path)
+
+        await self.transport.send(Frame(MsgType.SYNC_DELTA, {"state": state}))
+        log.info("[sync] Sent state to %s (found %d files)", self.username, len(state))
+
     async def _handle_mkdir(self, frame: Frame):
-        rel  = frame.meta["path"]
+        rel = frame.meta["path"]
         path = self._resolve(rel)
         path.mkdir(parents=True, exist_ok=True)
         log.info("[mkdir] %s", rel)
         await self.transport.send(ack(path=rel))
 
     async def _handle_delete(self, frame: Frame):
-        rel  = frame.meta["path"]
+        rel = frame.meta["path"]
         path = self._resolve(rel)
         if not path.exists():
             await self.transport.send(error(404, f"Not found: {rel}"))
@@ -255,8 +266,8 @@ class ClientSession:
         await self.transport.send(ack(path=rel))
 
     async def _handle_move(self, frame: Frame):
-        src  = self._resolve(frame.meta["src"])
-        dst  = self._resolve(frame.meta["dst"])
+        src = self._resolve(frame.meta["src"])
+        dst = self._resolve(frame.meta["dst"])
         if not src.exists():
             await self.transport.send(error(404, f"Not found: {frame.meta['src']}"))
             return
@@ -266,18 +277,18 @@ class ClientSession:
         await self.transport.send(ack())
 
     async def _handle_stat(self, frame: Frame):
-        rel  = frame.meta["path"]
+        rel = frame.meta["path"]
         path = self._resolve(rel)
         if not path.exists():
             await self.transport.send(error(404, f"Not found: {rel}"))
             return
         st = path.stat()
         await self.transport.send(Frame(MsgType.STAT_RESULT, {
-            "path":     rel,
-            "type":     "dir" if path.is_dir() else "file",
-            "size":     st.st_size,
+            "path": rel,
+            "type": "dir" if path.is_dir() else "file",
+            "size": st.st_size,
             "modified": st.st_mtime,
-            "sha256":   sha256(path.read_bytes()) if path.is_file() else None,
+            "sha256": calculate_file_hash(path) if path.is_file() else None,
         }))
 
     async def _handle_disconnect(self, frame: Frame):
@@ -286,24 +297,23 @@ class ClientSession:
         raise asyncio.IncompleteReadError(b"", 0)
 
 
-# ── Server entry point ─────────────────────────────────────────────────────────
-class ClouDriveServer:
+class NoPointServer:
     def __init__(
-        self,
-        host:         str = "127.0.0.1",
-        port:         int = 9876,
-        storage_root: str = "./storage",
-        users:        Optional[Dict[str, str]] = None,
+            self,
+            host: str = "127.0.0.1",
+            port: int = 9876,
+            storage_root: str = "./storage",
+            users: Optional[Dict[str, str]] = None,
     ):
-        self.host    = host
-        self.port    = port
-        self.root    = Path(storage_root)
-        self.users   = users or {"admin": "secret"}
+        self.host = host
+        self.port = port
+        self.root = Path(storage_root)
+        self.users = users or DEFAULT_USERS
         self.root.mkdir(parents=True, exist_ok=True)
 
     async def _handle(self, reader, writer):
         transport = Transport(reader, writer)
-        session   = ClientSession(transport, self.root, self.users)
+        session = ClientSession(transport, self.root, self.users)
         await session.run()
 
     async def serve_forever(self):
